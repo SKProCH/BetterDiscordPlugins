@@ -1,7 +1,7 @@
 /**
  * @name BetterDoubleClickToEdit
  * @author Atamol
- * @version 1.0.0
+ * @version 1.1.0
  * @description Double click your own message to quickly edit it.
  * @source https://github.com/Atamol/BetterDiscordPlugins
  */
@@ -27,6 +27,9 @@ module.exports = class BetterDoubleClickToEdit {
 
 	constructor(meta) { config.info = meta; }
 
+	_dragOrigin = null;
+	_dragged = false;
+
 	start() {
 		try {
 			this.selectedClass = Webpack.getModule(Filters.byKeys("message", "selected"))?.selected;
@@ -43,7 +46,10 @@ module.exports = class BetterDoubleClickToEdit {
 
 			this.doubleClickToEditModifier = Data.load(config.info.slug, "doubleClickToEditModifier") ?? false;
 			this.editModifier = Data.load(config.info.slug, "editModifier") ?? "shift";
+			this.cancelOnTextSelection = Data.load(config.info.slug, "cancelOnTextSelection") ?? true;
 
+			global.document.addEventListener('mousedown', this._onMouseDown);
+			global.document.addEventListener('mousemove', this._onMouseMove);
 			global.document.addEventListener('dblclick', this.doubleclickFunc);
 			global.document.addEventListener('click', this.altClickSuppressor, true);
 		}
@@ -53,6 +59,19 @@ module.exports = class BetterDoubleClickToEdit {
 			catch (e) { console.error(config.info?.name, "stop after error", e); }
 		}
 	}
+
+	_onMouseDown = (e) => {
+		this._dragOrigin = { x: e.clientX, y: e.clientY };
+		this._dragged = false;
+	};
+
+	_onMouseMove = (e) => {
+		if (!this._dragOrigin) return;
+		const dx = e.clientX - this._dragOrigin.x;
+		const dy = e.clientY - this._dragOrigin.y;
+		if (dx * dx + dy * dy > 25) // 5px threshold
+			this._dragged = true;
+	};
 
 	doubleclickFunc = (e) => this.handler(e);
 
@@ -66,6 +85,8 @@ module.exports = class BetterDoubleClickToEdit {
 	};
 
 	stop = () => {
+		document.removeEventListener('mousedown', this._onMouseDown);
+		document.removeEventListener('mousemove', this._onMouseMove);
 		document.removeEventListener('dblclick', this.doubleclickFunc);
 		document.removeEventListener('click', this.altClickSuppressor, true);
 	};
@@ -73,6 +94,13 @@ module.exports = class BetterDoubleClickToEdit {
 	getSettingsPanel() {
 		return UI.buildSettingsPanel({
 			settings: [
+				{
+					type: "switch",
+					id: "cancelOnTextSelection",
+					name: "Cancel Edit on Text Selection",
+					note: "Don't start editing if the double-click was a drag to select text",
+					value: this.cancelOnTextSelection
+				},
 				{
 					type: "switch",
 					id: "doubleClickToEditModifier",
@@ -100,6 +128,9 @@ module.exports = class BetterDoubleClickToEdit {
 	}
 
 	handler(e) {
+		if (this.cancelOnTextSelection && this._dragged)
+			return;
+
 		if (e.target?.closest?.('textarea, input, [contenteditable="true"]'))
 			return;
 

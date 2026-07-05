@@ -39,9 +39,9 @@ module.exports = class BetterDoubleClickToEdit {
 	// The edit we most recently opened, so Ctrl+C right after can close it.
 	_recentEdit = null;
 
-	// How long after opening an edit a Ctrl+C still counts as "I only wanted to
-	// copy, not edit" and closes the editor.
-	static COPY_CANCEL_WINDOW = 5000;
+	// Default copy-cancel window (ms). Configurable via copyCancelWindow setting;
+	// 0 = no timeout (track until the user acts).
+	static DEFAULT_COPY_CANCEL_WINDOW = 5000;
 
 	start() {
 		try {
@@ -62,6 +62,7 @@ module.exports = class BetterDoubleClickToEdit {
 			this.preserveSelection = Data.load(config.info.slug, "preserveSelection") ?? true;
 			this.tripleClickParagraph = Data.load(config.info.slug, "tripleClickParagraph") ?? true;
 			this.cancelEditOnCopy = Data.load(config.info.slug, "cancelEditOnCopy") ?? false;
+			this.copyCancelWindow = Data.load(config.info.slug, "copyCancelWindow") ?? BetterDoubleClickToEdit.DEFAULT_COPY_CANCEL_WINDOW;
 			this.debug = Data.load(config.info.slug, "debug") ?? false;
 
 			global.document.addEventListener('mousedown', this.mouseDownFunc, true);
@@ -162,6 +163,15 @@ module.exports = class BetterDoubleClickToEdit {
 				note: "If you press Ctrl+C to copy right after editing starts, close the editor instead of staying in edit mode",
 				value: this.cancelEditOnCopy
 			});
+			if (this.cancelEditOnCopy) {
+				settings.push({
+					type: "number",
+					id: "copyCancelWindow",
+					name: "Ctrl+C Window (ms)",
+					note: "How long after editing starts a Ctrl+C still closes the editor. 0 = no limit (until you press any other key).",
+					value: this.copyCancelWindow
+				});
+			}
 			settings.push({
 				type: "switch",
 				id: "debug",
@@ -200,7 +210,7 @@ module.exports = class BetterDoubleClickToEdit {
 		// buildSettingsPanel returns a React element and its `settings` are fixed
 		// at build time. Gating switches change which children exist, so host the
 		// panel in a component and force a re-render when a gate flips.
-		const gates = new Set(["preserveSelection", "doubleClickToEditModifier"]);
+		const gates = new Set(["preserveSelection", "doubleClickToEditModifier", "cancelEditOnCopy"]);
 		const self = this;
 
 		return React.createElement(function SettingsHost() {
@@ -268,7 +278,13 @@ module.exports = class BetterDoubleClickToEdit {
 				const { text: cleaned, map: cleanedMap } = this.stripLinePrefixes(raw);
 				const rMap = this.buildOffsetMap(renderedText, cleaned);
 				const toRaw = (i) => cleanedMap[Math.min(rMap[i], cleaned.length)];
-				const mapped = { start: toRaw(rendered.start), end: toRaw(rendered.end) };
+				// End: anchor to the LAST selected char (+1), not the next char.
+				// Mapping the next char swallows any gap between them (newline +
+				// next list-item prefix), bleeding the selection into the next item.
+				const toRawEnd = (endExcl) => endExcl > rendered.start
+					? cleanedMap[Math.min(rMap[endExcl - 1], cleaned.length - 1)] + 1
+					: toRaw(endExcl);
+				const mapped = { start: toRaw(rendered.start), end: toRawEnd(rendered.end) };
 				rawRange = this.refineRawRange(raw, mapped.start, mapped.end);
 
 				this.log("selection captured", {
@@ -294,31 +310,44 @@ module.exports = class BetterDoubleClickToEdit {
 			this.transferSelection(messageDiv, rawRange);
 	}
 
-	// Ctrl+C (or Cmd+C) shortly after an edit opened, with text selected, means
-	// the user only wanted to copy — close the editor without saving so the
-	// message reverts to its display state.
+	// First key after an edit opens decides its fate: Ctrl/Cmd+C (copy) with a
+	// selection means "I only wanted to copy" -> close the editor. Any other
+	// meaningful key (incl. Ctrl+X / Ctrl+V) means the user is really editing ->
+	// stop tracking. Pure modifier presses are ignored so a real Ctrl+C still
+	// registers. copyCancelWindow (ms) bounds how long we watch; 0 = no limit.
 	copyKeyFunc = (e) => {
 		if (!this.cancelEditOnCopy || !this._recentEdit) return;
+
+		// Ignore standalone modifier keydowns — they precede the actual shortcut.
+		if (["Control", "Meta", "Shift", "Alt", "AltGraph"].includes(e.key)) return;
+
+		// Expired window: drop tracking, act on nothing.
+		const window = this.copyCancelWindow;
+		if (window > 0 && Date.now() - this._recentEdit.at > window) {
+			this._recentEdit = null;
+			this.log("copy tracking expired");
+			return;
+		}
+
 		// Use e.code (physical key), not e.key: on a non-Latin layout (e.g.
 		// Russian) Ctrl+C reports e.key as "с" (Cyrillic), not "c".
-		if (e.code !== "KeyC" || !(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
+		const isCopy = e.code === "KeyC" && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
 
-		const age = Date.now() - this._recentEdit.at;
+		if (!isCopy) {
+			// Any other real action means the user is editing — stop tracking.
+			this._recentEdit = null;
+			this.log("copy tracking stopped: other key", { code: e.code });
+			return;
+		}
+
 		const selection = String(global.getSelection?.() ?? "");
 		this.log("copy key detected", {
-			age,
-			window: BetterDoubleClickToEdit.COPY_CANCEL_WINDOW,
 			hasSelection: selection !== "",
 			selectionSample: this.vis(selection.slice(0, 40)),
 			endEditType: typeof this.MessageActions?.endEditMessage
 		});
 
-		if (age > BetterDoubleClickToEdit.COPY_CANCEL_WINDOW) {
-			this._recentEdit = null;
-			this.log("copy ignored: outside window");
-			return;
-		}
-		// Only close when something is actually being copied.
+		// Copy with nothing selected copies nothing — leave the editor open.
 		if (selection === "") { this.log("copy ignored: no selection"); return; }
 		if (typeof this.MessageActions?.endEditMessage !== "function") {
 			this.log("copy ignored: endEditMessage unavailable");
@@ -363,28 +392,43 @@ module.exports = class BetterDoubleClickToEdit {
 		if (!contentEl.contains(range.startContainer) || !contentEl.contains(range.endContainer))
 			return null;
 
-		let start = 0, end = 0, foundStart = false, foundEnd = false;
-		const walker = document.createTreeWalker(contentEl, NodeFilter.SHOW_TEXT);
-		let node;
-		while ((node = walker.nextNode())) {
-			if (node === range.startContainer) { start += range.startOffset; foundStart = true; }
-			else if (!foundStart) start += node.textContent.length;
-
-			if (node === range.endContainer) { end += range.endOffset; foundEnd = true; }
-			else if (!foundEnd) end += node.textContent.length;
-
-			if (foundStart && foundEnd) break;
-		}
-		if (!foundStart || !foundEnd) return null;
+		const start = this.offsetOfPoint(contentEl, range.startContainer, range.startOffset);
+		const end = this.offsetOfPoint(contentEl, range.endContainer, range.endOffset);
+		if (start == null || end == null) return null;
 		return { start, end };
 	}
 
+	// Absolute textContent offset of a DOM point (container, offset) within root.
+	// Works whether the point sits in a text node (word/char selection) or an
+	// element node (a triple-click selecting a whole list item / paragraph, where
+	// the boundary lies between child nodes, not inside text).
+	offsetOfPoint(root, container, offset) {
+		const measure = document.createRange();
+		measure.selectNodeContents(root);
+		try { measure.setEnd(container, offset); }
+		catch { return null; }
+
+		let total = 0, node;
+		const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+		while ((node = walker.nextNode())) {
+			if (measure.comparePoint(node, 0) === 1) break; // node starts after point
+			if (measure.comparePoint(node, node.length) === 1) {
+				// The point falls inside this text node (only when it's the endpoint).
+				total += (measure.endContainer === node) ? measure.endOffset : 0;
+				break;
+			}
+			total += node.textContent.length; // node fully before the point
+		}
+		return total;
+	}
+
 	// Remove line-level markdown prefixes the renderer drops entirely:
-	//   "-# " subtext, "# "/"## "/"### " headers, "> "/">>> " quotes.
+	//   "-# " subtext, "# ".."### " headers, "> "/">>> " quotes, and list items
+	//   (optionally indented): "- ", "* ", "1. ". Order matters: "-# " before "- ".
 	// Returns the cleaned text plus map[cleanedIndex] = rawIndex (length + 1),
 	// so cleaned offsets can be composed back to real raw offsets.
 	stripLinePrefixes(raw) {
-		const prefix = /^(>>> |> |#{1,3} |-# )/;
+		const prefix = /^(>>> |> |#{1,3} |-# | *(?:[-*] |\d+\. ))/;
 		let text = "";
 		const map = [];
 		let atLineStart = true;
@@ -589,6 +633,10 @@ module.exports = class BetterDoubleClickToEdit {
 			const sel = global.getSelection();
 			sel.removeAllRanges();
 			sel.addRange(range);
+
+			// A tall message opens the editor scrolled to the caret/end, leaving an
+			// early selection off-screen. Scroll the selection start into view.
+			(startNode.parentElement ?? startNode).scrollIntoView?.({ block: "center", inline: "nearest" });
 
 			this.log("applied selection", {
 				requestedOffsets: { start: startOffset, end: endOffset },

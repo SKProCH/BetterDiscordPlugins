@@ -316,10 +316,23 @@ module.exports = class BetterDoubleClickToEdit {
 	// stop tracking. Pure modifier presses are ignored so a real Ctrl+C still
 	// registers. copyCancelWindow (ms) bounds how long we watch; 0 = no limit.
 	copyKeyFunc = (e) => {
-		if (!this.cancelEditOnCopy || !this._recentEdit) return;
-
 		// Ignore standalone modifier keydowns — they precede the actual shortcut.
 		if (["Control", "Meta", "Shift", "Alt", "AltGraph"].includes(e.key)) return;
+
+		// While waiting to distinguish a double click from a triple click, Ctrl+C
+		// means the user wants to copy the selection, not open the editor.
+		const isCopy = e.code === "KeyC" && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
+		if (isCopy && this.tripleClickParagraph && this.preserveSelection && this._gesture?.timer) {
+			const selection = String(global.getSelection?.() ?? "");
+			if (selection !== "") {
+				clearTimeout(this._gesture.timer);
+				this._gesture = null;
+				this.log("pending edit cancelled after copy");
+				return;
+			}
+		}
+
+		if (!this.cancelEditOnCopy || !this._recentEdit) return;
 
 		// Expired window: drop tracking, act on nothing.
 		const window = this.copyCancelWindow;
@@ -331,8 +344,6 @@ module.exports = class BetterDoubleClickToEdit {
 
 		// Use e.code (physical key), not e.key: on a non-Latin layout (e.g.
 		// Russian) Ctrl+C reports e.key as "с" (Cyrillic), not "c".
-		const isCopy = e.code === "KeyC" && (e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey;
-
 		if (!isCopy) {
 			// Any other real action means the user is editing — stop tracking.
 			this._recentEdit = null;

@@ -109,7 +109,20 @@ module.exports = class BetterDoubleClickToEdit {
 		const g = this._gesture;
 		if (!g || e.button !== 0) return;
 
-		const commit = () => { this._gesture = null; this.commitEdit(g.messageDiv, g.message); };
+		// Capture the browser selection before the settle delay. Discord can clear
+		// it while the delayed triple-click decision is still pending.
+		if (this.preserveSelection) {
+			const contentEl = g.messageDiv.querySelector('[id^="message-content"]') || g.messageDiv;
+			g.selection = this.getSelectionOffsets(contentEl);
+			g.selectionRoot = contentEl;
+			if (!g.selection && contentEl !== g.messageDiv) {
+				g.selectionRoot = g.messageDiv;
+				g.selection = this.getSelectionOffsets(g.messageDiv);
+			}
+			g.selectionText = g.selectionRoot.textContent ?? "";
+		}
+
+		const commit = () => { this._gesture = null; this.commitEdit(g.messageDiv, g.message, g.selection, g.selectionText); };
 		if (this.tripleClickParagraph && this.preserveSelection)
 			g.timer = setTimeout(commit, BetterDoubleClickToEdit.SETTLE_DELAY);
 		else
@@ -258,16 +271,16 @@ module.exports = class BetterDoubleClickToEdit {
 		return { messageDiv, message };
 	}
 
-	commitEdit(messageDiv, message) {
+	commitEdit(messageDiv, message, capturedSelection = null, capturedSelectionText = null) {
 		// Capture the selection BEFORE the edit box replaces the message. The edit
 		// box holds raw markdown (message.content) while the view shows rendered
 		// text, so we align the two character-by-character to translate offsets.
 		let rawRange = null;
 		if (this.preserveSelection) {
 			const contentEl = messageDiv.querySelector('[id^="message-content"]') || messageDiv;
-			let rendered = this.getSelectionOffsets(contentEl);
+			let rendered = capturedSelection || this.getSelectionOffsets(contentEl);
 			if (rendered) {
-				const renderedText = contentEl.textContent ?? "";
+				const renderedText = capturedSelectionText ?? contentEl.textContent ?? "";
 				const raw = message.content ?? "";
 				// A double-click often grabs the trailing space after a word; drop
 				// leading/trailing whitespace so it isn't carried into the edit box.
